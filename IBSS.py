@@ -16,9 +16,15 @@ def decode(encoded_particle):
 
     pass
 
+def mask_and_normalise(probs, mask):
+
+    masked_vector = np.where(mask == 0, probs, 0)
+
+    return masked_vector/np.sum(masked_vector)
+
 class ProposalState:
 
-    def __init__(self, omega, alphas, mus, vars):
+    def __init__(self, omega, log_alphas, mus, vars):
         '''
 
         :param omega: 1 x N vector of transformed omega values
@@ -28,13 +34,13 @@ class ProposalState:
         '''
 
         self.omega = omega
-        self.alphas = np.array(alphas)
+        self.log_alphas = np.array(log_alphas)
         self.mus = np.array(mus)
         self.vars = np.array(vars)
 
     def compute_deletion_probs(self):
 
-        maxprobs = np.max(self.alphas, axis=1)
+        maxprobs = np.max(np.exp(self.alphas), axis=1)
         delprobs = 1.0 - maxprobs
 
         total = np.sum(delprobs)
@@ -42,7 +48,7 @@ class ProposalState:
         if not np.isfinite(total):
             raise ValueError(
                 f"Invalid deletion probabilities: "
-                f"alphas contain non-finite values.\n{self.alphas}"
+                f"alphas contain non-finite values.\n{self.log_alphas}"
             )
 
         if total <= 0:
@@ -53,12 +59,19 @@ class ProposalState:
         return delprobs / total
 
     def sample_particle(self):
-        g = np.zeros((len(self.alphas), len(self.alphas[0])))
-        b = np.zeros((len(self.alphas), len(self.alphas[0])))
+        g = np.zeros((len(self.log_alphas), len(self.log_alphas[0])))
+        b = np.zeros((len(self.log_alphas), len(self.log_alphas[0])))
 
-        for i in range(len(self.alphas)):
+        for i in range(len(self.log_alphas)):
 
-            j = np.random.choice([k for k in range(len(self.alphas[0]))], p = np.exp(self.alphas[i]))
+            if i == 0:
+                probmask = np.zeros_like(g[0])
+            else:
+                probmask += g[i-1]
+
+            probs = mask_and_normalise(np.exp(self.log_alphas[i]), probmask)
+
+            j = np.random.choice([k for k in range(len(self.log_alphas[0]))], p = probs)
 
             g[i,j] = 1
             b[i,j] = norm.rvs(self.mus[i,j], np.sqrt(self.vars[i,j]))
@@ -82,8 +95,8 @@ class Particle:
         self.gamma = gamma
         self.beta = beta
 
-
         self.L = gamma.shape[0]
+        self.selected_variables = np.where(np.sum(gamma, axis = 0) != 0, 1, 0)
         self.coefficient_array = np.sum(beta, axis = 0) # 1 x M vector of coefficients
         self.variables = len(self.coefficient_array)
 
@@ -190,7 +203,14 @@ class InitProposal:
         b = np.zeros((l,self.m))
 
         for i in range(l):
-            j = np.random.choice(self.m, p = self.pi)
+            if i == 0:
+                mask = np.zeros_like(self.mus[0])
+            else:
+                mask = g[i-1]
+
+            probs = mask_and_normalise(self.pi, mask)
+
+            j = np.random.choice(self.m, p = probs)
 
             g[i,j] = 1
             b[i,j] = norm.rvs(self.mus[j], np.sqrt(self.vars[j]))
@@ -413,7 +433,7 @@ class Proposal:
             comp = np.where(proposed.gamma[i] == 1)[0][0]
             b = proposed.beta[i, comp]
 
-            log_alpha = state.alphas[i, comp]
+            log_alpha = state.log_alphas[i, comp]
             mu = state.mus[i, comp]
             var = state.vars[i, comp]
 
@@ -442,7 +462,7 @@ class Proposal:
             for i in range(current.L):
                 comp = np.where(proposed.gamma[i] == 1)[0][0]
 
-                log_alpha = state.alphas[i, comp]
+                log_alpha = state.log_alphas[i, comp]
 
                 log_beta = norm.logpdf(
                     proposed.beta[i, comp],
@@ -485,12 +505,15 @@ class Proposal:
         omega = current.compute_omega(self.proposal_generator.X)
         residuals = self.proposal_generator.compute_full_residual(current)
 
-        a, m, s = self.proposal_generator.calculate_SER(residuals, omega)
+        log_a, m, s = self.proposal_generator.calculate_SER(residuals, omega)
 
         new_g = np.zeros_like(current.beta[0])
         new_b = np.zeros_like(current.beta[0])
 
-        new_comp = np.random.choice(len(a), p = np.exp(a))
+        mask = current.selected_variables
+        probs = mask_and_normalise(np.exp(log_a), mask)
+
+        new_comp = np.random.choice(len(log_a), p = probs)
 
         new_g[new_comp] = 1
         new_b[new_comp] = norm.rvs(m[new_comp], np.sqrt(s[new_comp]))
@@ -534,7 +557,9 @@ class Proposal:
         omega = current.compute_omega(self.proposal_generator.X)
         residuals = self.proposal_generator.compute_full_residual(current)
 
-        a, m, s = self.proposal_generator.calculate_SER(residuals, omega)
+        log_a, m, s = self.proposal_generator.calculate_SER(residuals, omega)
+
+        aprobs = mask_and_normalise(np.exp(log_a), current.selected_variables)
 
         added_log_probs = []
 
@@ -550,7 +575,7 @@ class Proposal:
             )
 
             added_log_probs.append(
-                coeff_prob + a[comp]
+                coeff_prob + np.log(aprobs[comp])
             )
 
         # If multiple identical rows can be removed to give the same
